@@ -361,6 +361,7 @@ mod tests {
             max_length: 256,
             use_quantized: true,
             embed_timeout_ms: 5000,
+            idle_unload_secs: 300,
         };
         Arc::new(MiniLMEmbedder::new_simplified(config).unwrap())
     }
