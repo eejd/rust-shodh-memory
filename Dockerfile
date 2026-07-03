@@ -1,6 +1,7 @@
-# Multi-stage build for minimal final image
+# Multi-stage build for minimal final image — linux/amd64 + linux/arm64
 # Stage 1: Build the Rust binary with all native dependencies
 FROM rust:1-slim-bookworm AS builder
+ARG TARGETARCH
 
 # Install build dependencies:
 #   g++ / clang-14  — C++ compiler for RocksDB (cc-rs looks for "c++")
@@ -28,12 +29,17 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 
 # Download ONNX Runtime for embedding model inference (cacheable independent of source)
+# Supports linux/amd64 (x64) and linux/arm64 (aarch64). TARGETARCH is set by BuildKit.
 ARG ORT_VERSION=1.23.2
-RUN curl -L -o ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" \
+RUN case "${TARGETARCH:-amd64}" in \
+      arm64) ORT_ARCH=aarch64 ;; \
+      *)     ORT_ARCH=x64 ;; \
+    esac \
+    && curl -L -o ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}.tgz" \
     && tar -xzf ort.tgz \
-    && cp onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so.${ORT_VERSION} /usr/local/lib/libonnxruntime.so \
+    && cp onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}/lib/libonnxruntime.so.${ORT_VERSION} /usr/local/lib/libonnxruntime.so \
     && ldconfig \
-    && rm -rf ort.tgz onnxruntime-linux-x64-${ORT_VERSION}
+    && rm -rf ort.tgz onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}
 
 ENV ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so
 
