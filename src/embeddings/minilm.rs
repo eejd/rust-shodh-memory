@@ -13,13 +13,17 @@
 //! - SHODH_EMBED_TIMEOUT_MS: Embedding timeout in ms (default: 5000)
 //! - SHODH_LAZY_LOAD: Set to "false" to load model at startup (default: true)
 //! - SHODH_ONNX_THREADS: Number of ONNX threads (default: 1 on macOS ARM64, 2 elsewhere)
+//! - SHODH_EMBED_IDLE_SECS: Unload the model after N idle seconds to free ~335 MB RAM
+//!   (default: 300; set to 0 to keep the model resident, restoring the previous behaviour)
 
 use anyhow::{Context, Result};
 use ort::session::Session;
 use ort::value::Value;
 use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 
 use super::Embedder;
@@ -98,6 +102,119 @@ impl LazyModel {
     }
 }
 
+/// Shared, unloadable holder for the ONNX model.
+///
+/// Wrapped in an `Arc` so a detached reaper thread can hold a `Weak` reference and drop
+/// the model after an idle period without keeping the embedder itself alive.
+struct ModelSlot {
+    /// The loaded model, or `None` when unloaded. `Arc` so in-flight embed calls keep a
+    /// strong reference — the ~335 MB is only freed once the last in-flight call finishes.
+    model: Mutex<Option<Arc<LazyModel>>>,
+    /// Timestamp of the most recent embed request, read by the idle reaper.
+    last_use: Mutex<Instant>,
+    /// Idle duration after which the model is unloaded. `Duration::ZERO` disables unload.
+    idle_unload: Duration,
+    /// Config used to (re)load the model.
+    config: EmbeddingConfig,
+    /// Ensures the reaper thread is spawned at most once.
+    reaper_started: AtomicBool,
+}
+
+impl ModelSlot {
+    fn new(config: EmbeddingConfig) -> Self {
+        let idle_unload = Duration::from_secs(config.idle_unload_secs);
+        Self {
+            model: Mutex::new(None),
+            last_use: Mutex::new(Instant::now()),
+            idle_unload,
+            config,
+            reaper_started: AtomicBool::new(false),
+        }
+    }
+
+    /// Return the loaded model, loading it (and recording use) if necessary.
+    ///
+    /// Returns an owned `Arc` clone so the caller keeps a strong reference for the duration
+    /// of its inference even if the reaper unloads the shared slot concurrently.
+    ///
+    /// # Reload-race note (benign)
+    /// If the reaper sets the slot to `None` while an embed is in progress, the in-flight
+    /// call continues unaffected because it already holds a strong `Arc<LazyModel>`. The
+    /// ~335 MB is freed only once that final strong reference is released. The next embed
+    /// request after an unload transparently triggers a reload (~200 ms).
+    fn get_or_load(self: &Arc<Self>) -> Result<Arc<LazyModel>> {
+        *self.last_use.lock() = Instant::now();
+
+        let mut guard = self.model.lock();
+        if let Some(model) = guard.as_ref() {
+            return Ok(model.clone());
+        }
+
+        // Model is unloaded (or was never loaded). Load it now.
+        let model = Arc::new(LazyModel::new(&self.config)?);
+        *guard = Some(model.clone());
+        drop(guard); // release before spawning reaper to avoid potential deadlock
+
+        self.maybe_start_reaper();
+        Ok(model)
+    }
+
+    /// Whether the model is currently resident.
+    fn is_loaded(&self) -> bool {
+        self.model.lock().is_some()
+    }
+
+    /// Spawn the idle-unload reaper thread once, if unloading is enabled.
+    ///
+    /// The thread holds a `Weak<ModelSlot>` and exits as soon as the slot is dropped
+    /// (i.e. when the embedder itself is dropped), so there is no memory leak.
+    fn maybe_start_reaper(self: &Arc<Self>) {
+        if self.idle_unload.is_zero() {
+            return;
+        }
+        // Use swap so only the first caller enters the spawn path.
+        if self.reaper_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        // Wake at most every 60 s to keep unload latency bounded for long timeouts.
+        let tick = self.idle_unload.min(Duration::from_secs(60));
+        let weak: Weak<ModelSlot> = Arc::downgrade(self);
+
+        let result = std::thread::Builder::new()
+            .name("shodh-embed-reaper".into())
+            .spawn(move || loop {
+                std::thread::sleep(tick);
+                // Exit gracefully once the embedder (and its slot Arc) has been dropped.
+                let Some(slot) = weak.upgrade() else {
+                    return;
+                };
+                let idle_for = slot.last_use.lock().elapsed();
+                if idle_for < slot.idle_unload {
+                    continue;
+                }
+                let mut guard = slot.model.lock();
+                if guard.is_some() {
+                    *guard = None; // drop Arc; RAM freed once all in-flight calls release it
+                    drop(guard);
+                    tracing::info!(
+                        "Unloaded MiniLM model after {:.0}s idle (SHODH_EMBED_IDLE_SECS={}s)",
+                        idle_for.as_secs_f64(),
+                        slot.idle_unload.as_secs(),
+                    );
+                }
+            });
+
+        if let Err(e) = result {
+            tracing::warn!(
+                "Failed to spawn embed idle-unload reaper: {e}; model will stay resident"
+            );
+            // Allow a future call to try again.
+            self.reaper_started.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Configuration for MiniLM embedder
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
@@ -115,6 +232,10 @@ pub struct EmbeddingConfig {
 
     /// Timeout for embedding generation in milliseconds
     pub embed_timeout_ms: u64,
+
+    /// Unload the ONNX model after this many idle seconds to free ~335 MB RAM.
+    /// Set to 0 to keep the model resident (previous behaviour).
+    pub idle_unload_secs: u64,
 }
 
 impl Default for EmbeddingConfig {
@@ -167,6 +288,11 @@ impl EmbeddingConfig {
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(true);
 
+        let idle_unload_secs = std::env::var("SHODH_EMBED_IDLE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+
         let model_filename = if use_quantized {
             "model_quantized.onnx"
         } else {
@@ -179,6 +305,7 @@ impl EmbeddingConfig {
             max_length: 256,
             use_quantized,
             embed_timeout_ms,
+            idle_unload_secs,
         }
     }
 
@@ -190,20 +317,22 @@ impl EmbeddingConfig {
             max_length: 256,
             use_quantized: true,
             embed_timeout_ms: 5000,
+            idle_unload_secs: 300,
         }
     }
 }
 
 /// MiniLM-L6-v2 embedder with ONNX Runtime
 ///
-/// Features lazy model loading for edge devices:
+/// Features lazy model loading and idle-timeout unloading for edge devices:
 /// - Model is only loaded on first embed() call
 /// - Reduces startup time from ~2s to <100ms
-/// - Reduces idle RAM by ~200MB until first use
+/// - After `SHODH_EMBED_IDLE_SECS` seconds of inactivity the model is dropped,
+///   freeing ~335 MB of RAM; it is transparently reloaded on the next request
 pub struct MiniLMEmbedder {
     config: EmbeddingConfig,
-    /// Lazily initialized model (OnceLock for thread-safe init)
-    lazy_model: OnceLock<Result<Arc<LazyModel>, String>>,
+    /// Lazily-loaded, idle-unloadable model holder (Arc so the reaper can hold a Weak).
+    slot: Arc<ModelSlot>,
     /// Flag for simplified mode (no ONNX)
     simplified_mode: bool,
     dimension: usize,
@@ -401,7 +530,7 @@ impl MiniLMEmbedder {
 
         let embedder = Self {
             config: config.clone(),
-            lazy_model: OnceLock::new(),
+            slot: Arc::new(ModelSlot::new(config)),
             simplified_mode: false,
             dimension: 384,
         };
@@ -417,23 +546,18 @@ impl MiniLMEmbedder {
         Ok(embedder)
     }
 
-    /// Ensure the model is loaded (thread-safe, idempotent)
-    fn ensure_model_loaded(&self) -> Result<&Arc<LazyModel>> {
-        let result = self.lazy_model.get_or_init(|| {
-            LazyModel::new(&self.config)
-                .map(Arc::new)
-                .map_err(|e| e.to_string())
-        });
-
-        match result {
-            Ok(model) => Ok(model),
-            Err(e) => Err(anyhow::anyhow!("Failed to load model: {e}")),
-        }
+    /// Ensure the model is loaded, returning an owned Arc for the duration of the call.
+    ///
+    /// After `SHODH_EMBED_IDLE_SECS` seconds of inactivity the background reaper may have
+    /// unloaded the model; this method transparently reloads it. Errors are NOT cached, so
+    /// a transient failure (e.g. disk hiccup) will be retried on the next call.
+    fn ensure_model_loaded(&self) -> Result<Arc<LazyModel>> {
+        self.slot.get_or_load().context("Failed to load model")
     }
 
-    /// Check if model is currently loaded (for diagnostics)
+    /// Check if model is currently resident in memory (for diagnostics / health endpoints)
     pub fn is_model_loaded(&self) -> bool {
-        self.lazy_model.get().is_some()
+        self.slot.is_loaded()
     }
 
     /// Create simplified embedder as fallback when model files are missing
@@ -451,8 +575,8 @@ impl MiniLMEmbedder {
         tracing::warn!("    Tokenizer: {:?}", config.tokenizer_path);
 
         Ok(Self {
+            slot: Arc::new(ModelSlot::new(config.clone())),
             config,
-            lazy_model: OnceLock::new(),
             simplified_mode: true,
             dimension: 384,
         })
@@ -970,6 +1094,7 @@ mod tests {
             max_length: 256,
             use_quantized: true,
             embed_timeout_ms: 5000,
+            idle_unload_secs: 300,
         };
         let embedder = MiniLMEmbedder::new_simplified(config).unwrap();
 
@@ -992,6 +1117,7 @@ mod tests {
             max_length: 256,
             use_quantized: true,
             embed_timeout_ms: 5000,
+            idle_unload_secs: 300,
         };
         let embedder = MiniLMEmbedder::new_simplified(config).unwrap();
 
@@ -1002,5 +1128,22 @@ mod tests {
         for emb in embeddings {
             assert_eq!(emb.len(), 384);
         }
+    }
+
+    #[test]
+    fn test_idle_unload_config_defaults() {
+        // Default config must request a 300-second idle timeout.
+        let cfg = EmbeddingConfig::with_paths(PathBuf::from("m.onnx"), PathBuf::from("t.json"));
+        assert_eq!(cfg.idle_unload_secs, 300);
+
+        // ModelSlot must treat a nonzero timeout as enabled …
+        let slot_enabled = ModelSlot::new(cfg.clone());
+        assert!(!slot_enabled.idle_unload.is_zero());
+
+        // … and zero as "stay resident" (disabled).
+        let mut cfg_off = cfg;
+        cfg_off.idle_unload_secs = 0;
+        let slot_disabled = ModelSlot::new(cfg_off);
+        assert!(slot_disabled.idle_unload.is_zero());
     }
 }
